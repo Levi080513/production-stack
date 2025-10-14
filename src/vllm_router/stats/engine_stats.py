@@ -215,4 +215,4 @@ def initialize_engine_stats_scraper(scrape_interval: float) -> EngineStatsScrape
 
 def get_engine_stats_scraper() -> EngineStatsScraper:
     # This call returns the already-initialized instance (or raises an error if not yet initialized)
-    return EngineStatsScraper()
+    return EngineStatsScraper(_create=False)
