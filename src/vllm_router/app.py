@@ -35,6 +35,8 @@ from vllm_router.routers.metrics_router import metrics_router
 from vllm_router.routers.routing_logic import (
     get_routing_logic,
     initialize_routing_logic,
+    DefaultRoutingLogic,
+    AllRoutingLogic,
 )
 from vllm_router.service_discovery import (
     ServiceDiscoveryType,
@@ -98,8 +100,8 @@ async def lifespan(app: FastAPI):
 
     # Close the threaded-components
     logger.info("Closing engine stats scraper")
-    engine_stats_scraper = get_engine_stats_scraper()
-    engine_stats_scraper.close()
+    if app.state.engine_stats_scraper is not None:
+        app.state.engine_stats_scraper.close()
 
     logger.info("Closing service discovery module")
     service_discovery = get_service_discovery()
@@ -175,7 +177,9 @@ def initialize_all(app: FastAPI, args):
         raise ValueError(f"Invalid service discovery type: {args.service_discovery}")
 
     # Initialize singletons via custom functions.
-    initialize_engine_stats_scraper(args.engine_stats_interval)
+    if args.engine_stats:
+        initialize_engine_stats_scraper(args.engine_stats_interval)
+
     initialize_request_stats_monitor(args.request_stats_window)
 
     if args.enable_batch_api:
@@ -202,14 +206,27 @@ def initialize_all(app: FastAPI, args):
     if args.callbacks:
         configure_custom_callbacks(args.callbacks, app)
 
-    initialize_routing_logic(
-        args.routing_logic,
-        session_key=args.session_key,
-        lmcache_controller_port=args.lmcache_controller_port,
-        prefill_model_labels=args.prefill_model_labels,
-        decode_model_labels=args.decode_model_labels,
-        kv_aware_threshold=args.kv_aware_threshold,
-    )
+    # support global routing logic initialization
+    # default to initialize required routing logics
+    for logic in DefaultRoutingLogic:
+        initialize_routing_logic(
+                logic,
+                session_key=args.session_key,
+                lmcache_controller_port=args.lmcache_controller_port,
+                prefill_model_labels=args.prefill_model_labels,
+                decode_model_labels=args.decode_model_labels,
+                kv_aware_threshold=args.kv_aware_threshold,
+        )
+    if args.routing_logic == "all":
+        for logic in AllRoutingLogic:
+            initialize_routing_logic(
+                logic,
+                session_key=args.session_key,
+                lmcache_controller_port=args.lmcache_controller_port,
+                prefill_model_labels=args.prefill_model_labels,
+                decode_model_labels=args.decode_model_labels,
+                kv_aware_threshold=args.kv_aware_threshold,
+            )
 
     # Initialize feature gates
     initialize_feature_gates(args.feature_gates)

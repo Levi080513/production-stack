@@ -26,9 +26,14 @@ from requests import JSONDecodeError
 
 from vllm_router.log import init_logger
 from vllm_router.routers.routing_logic import (
+    ConsistentHashRouter,
     DisaggregatedPrefillRouter,
     KvawareRouter,
     PrefixAwareRouter,
+    RoundRobinRouter,
+    SessionRouter,
+    StaticHashRouter,
+    get_routing_logic_by_type,
 )
 from vllm_router.service_discovery import get_service_discovery
 from vllm_router.services.request_service.rewriter import (
@@ -50,7 +55,6 @@ except ImportError:
 from vllm_router.services.metrics_service import num_incoming_requests_total
 
 logger = init_logger(__name__)
-
 
 # TODO: (Brian) check if request is json beforehand
 async def process_request(
@@ -139,7 +143,11 @@ async def process_request(
 
 
 async def route_general_request(
-    request: Request, endpoint: str, background_tasks: BackgroundTasks
+    request: Request,
+    endpoint: str,
+    background_tasks: BackgroundTasks,
+    workspace: Optional[str] = None,
+    endpoint_name: Optional[str] = None,
 ):
     """
     Route the incoming request to the backend server and stream the response back to the client.
@@ -219,29 +227,43 @@ async def route_general_request(
     if hasattr(service_discovery, "has_ever_seen_model"):
         model_ever_existed = service_discovery.has_ever_seen_model(requested_model)
 
-    if not request_endpoint:
+    # --- Endpoint Filtering ---
+    # 1. Initial filter by requested model and sleep status
+    endpoints = list(
+        filter(
+            lambda x: requested_model in x.model_names and not x.sleep,
+            endpoints,
+        )
+    )
+
+    # 2. Further filter by workspace and endpoint name if provided
+    if workspace and endpoint_name:
         endpoints = list(
             filter(
-                lambda x: requested_model in x.model_names and not x.sleep,
-                endpoints,
-            )
-        )
-        engine_stats = request.app.state.engine_stats_scraper.get_engine_stats()
-        request_stats = request.app.state.request_stats_monitor.get_request_stats(
-            time.time()
-        )
-    else:
-        endpoints = list(
-            filter(
-                lambda x: requested_model in x.model_names
-                and x.Id == request_endpoint
-                and not x.sleep,
+                lambda x: x.workspace == workspace and x.endpoint == endpoint_name,
                 endpoints,
             )
         )
 
+    # 3. Finally, filter by specific endpoint ID if provided in query params
+    if request_endpoint:
+        endpoints = list(
+            filter(
+                lambda x: x.Id == request_endpoint,
+                endpoints,
+            )
+        )
+    # Get engine stats and request stats
+    engine_stats = {}
+    if request.app.state.engine_stats_scraper is not None:
+        engine_stats = request.app.state.engine_stats_scraper.engine_stats
+
+    request_stats = request.app.state.request_stats_monitor.get_request_stats(
+        time.time()
+    )
+
     # Track all valid incoming requests
-    num_incoming_requests_total.labels(model=requested_model).inc()
+    num_incoming_requests_total.labels(workspace=workspace, endpoint=endpoint_name).inc()
 
     if not endpoints:
         if not model_ever_existed:
@@ -269,14 +291,17 @@ async def route_general_request(
             f"Routing request {request_id} to engine with Id: {endpoints[0].Id}"
         )
 
-    elif isinstance(request.app.state.router, KvawareRouter) or isinstance(
-        request.app.state.router, PrefixAwareRouter
-    ):
-        server_url = await request.app.state.router.route_request(
+    routing_logic = endpoints[0].routing_logic if endpoints else "roundrobin"
+    router = get_routing_logic_by_type(routing_logic)
+
+    if isinstance(router, KvawareRouter) or isinstance(
+        router, PrefixAwareRouter
+    ) or isinstance(router, ConsistentHashRouter) or isinstance(router, StaticHashRouter):
+        server_url = await router.route_request(
             endpoints, engine_stats, request_stats, request, request_json
         )
     else:
-        server_url = request.app.state.router.route_request(
+        server_url = router.route_request(
             endpoints, engine_stats, request_stats, request
         )
 
@@ -576,9 +601,6 @@ async def route_general_transcriptions(
         get_service_discovery()
     )  # This one is often still accessed directly via its get function
     router = request.app.state.router  # Access router from app.state
-    engine_stats_scraper = (
-        request.app.state.engine_stats_scraper
-    )  # Access engine_stats_scraper from app.state
     request_stats_monitor = (
         request.app.state.request_stats_monitor
     )  # Access request_stats_monitor from app.state
@@ -600,7 +622,10 @@ async def route_general_transcriptions(
         )
 
     # grab the current engine and request stats
-    engine_stats = engine_stats_scraper.get_engine_stats()
+    # get engine stats and request stats
+    engine_stats = {}
+    if request.app.state.engine_stats_scraper is not None:
+        engine_stats = request.app.state.engine_stats_scraper.engine_stats
     request_stats = request_stats_monitor.get_request_stats(time.time())
 
     # pick one using the router's configured logic (roundrobin, least-loaded, etc.)
