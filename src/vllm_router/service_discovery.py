@@ -111,12 +111,6 @@ class EndpointInfo:
     # Pod name
     pod_name: Optional[str] = None
 
-    # Workspace
-    workspace: Optional[str] = None
-
-    # Endpoint
-    endpoint: Optional[str] = None
-
     # Service name
     service_name: Optional[str] = None
 

@@ -20,7 +20,9 @@ import hashlib
 import math
 import random
 import threading
+import time
 import uuid
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 
 import requests
@@ -508,6 +510,15 @@ class DisaggregatedPrefillRouter(RoutingInterface):
             return decoder_endpoints[0].url
 
 
+@dataclass
+class HashRingState:
+    """Encapsulates hash ring state for a specific workspace+endpoint combination."""
+    hash_to_endpoint_url: Dict[int, str] = field(default_factory=dict)
+    sorted_hashes: List[int] = field(default_factory=list)
+    available_replicas: Dict[str, EndpointInfo] = field(default_factory=dict)
+    last_sync_time: float = 0.0
+
+
 class ConsistentHashRouter(RoutingInterface):
     """
     Route requests using Consistent Hashing with Bounded Loads (CHWBL).
@@ -522,6 +533,7 @@ class ConsistentHashRouter(RoutingInterface):
     - Cache key extraction from chat completions (system prompt + user messages)
     - Integration with K8sPodIPServiceDiscovery via callbacks
     - Load tracking via RequestStatsMonitor
+    - Multi-tenant support with separate hash rings per workspace+endpoint
     """
 
     def __init__(
@@ -546,12 +558,8 @@ class ConsistentHashRouter(RoutingInterface):
         self._load_factor = load_factor
         self._max_user_messages_for_cache = max_user_messages_for_cache
 
-        # Hash ring data structures
-        self._hash_to_endpoint_url: Dict[int, str] = {}  # Hash -> endpoint URL
-        self._sorted_hashes: List[int] = []  # Sorted list of hash points
-
-        # Available replicas (maintained via service discovery callbacks)
-        self._available_replicas: Dict[str, EndpointInfo] = {}
+        # Hash ring data structures - separate ring per workspace+endpoint
+        self._hash_rings: Dict[str, HashRingState] = {}
         self._replicas_lock = threading.Lock()
 
         # Register callback with service discovery
@@ -610,22 +618,56 @@ class ConsistentHashRouter(RoutingInterface):
         with self._replicas_lock:
             if event_type == ServiceDiscoveryEventType.ENGINE_ADDED:
                 if endpoint_info:
-                    # _add_replica_to_ring now handles idempotency
-                    was_added = endpoint_info.url not in self._available_replicas
-                    self._add_replica_to_ring(endpoint_info)
+                    routing_key = self._get_routing_key(endpoint_info)
+                    ring = self._get_or_create_ring(routing_key)
+                    was_added = endpoint_info.url not in ring.available_replicas
+                    self._add_replica_to_ring(ring, endpoint_info)
                     if was_added:
                         logger.info(
                             f"ConsistentHashRouter: Added replica {engine_name} "
-                            f"at {endpoint_info.url}"
+                            f"at {endpoint_info.url} to ring {routing_key}"
                         )
 
             elif event_type == ServiceDiscoveryEventType.ENGINE_DELETED:
-                if endpoint_info and endpoint_info.url in self._available_replicas:
-                    self._remove_replica_from_ring(endpoint_info.url)
-                    logger.info(
-                        f"ConsistentHashRouter: Removed replica {engine_name} "
-                        f"at {endpoint_info.url}"
-                    )
+                if endpoint_info:
+                    routing_key = self._get_routing_key(endpoint_info)
+                    if routing_key in self._hash_rings:
+                        ring = self._hash_rings[routing_key]
+                        if endpoint_info.url in ring.available_replicas:
+                            self._remove_replica_from_ring(ring, endpoint_info.url)
+                            logger.info(
+                                f"ConsistentHashRouter: Removed replica {engine_name} "
+                                f"at {endpoint_info.url} from ring {routing_key}"
+                            )
+
+    def _get_routing_key(self, endpoint_info: EndpointInfo) -> str:
+        """
+        Extract routing key from endpoint info.
+
+        Args:
+            endpoint_info: Endpoint information
+
+        Returns:
+            Routing key in format "workspace:endpoint"
+        """
+        workspace = endpoint_info.workspace
+        endpoint = endpoint_info.endpoint
+        return f"{workspace}:{endpoint}"
+
+    def _get_or_create_ring(self, routing_key: str) -> HashRingState:
+        """
+        Get or create a hash ring for the given routing key.
+
+        Args:
+            routing_key: The routing key (workspace:endpoint)
+
+        Returns:
+            HashRingState for this routing key
+        """
+        if routing_key not in self._hash_rings:
+            self._hash_rings[routing_key] = HashRingState()
+            logger.debug(f"Created new hash ring for routing key: {routing_key}")
+        return self._hash_rings[routing_key]
 
     def _hash(self, key: str) -> int:
         """Hash a key to an integer value using MD5."""
@@ -633,44 +675,46 @@ class ConsistentHashRouter(RoutingInterface):
         # Use first 16 hex characters (8 bytes) as an integer
         return int(hash_obj.hexdigest()[:16], 16)
 
-    def _search(self, key_hash: int) -> Tuple[int, int]:
+    def _search(self, ring: HashRingState, key_hash: int) -> Tuple[int, int]:
         """
         Find the hash point and its index on the ring for a given key hash.
 
         Args:
+            ring: The hash ring state to search
             key_hash: The hash value to search for
 
         Returns:
             Tuple of (hash_value, index) on the ring
         """
-        if not self._sorted_hashes:
+        if not ring.sorted_hashes:
             raise ValueError("Hash ring is empty")
 
         # Binary search for the first hash >= key_hash
-        idx = bisect.bisect_left(self._sorted_hashes, key_hash)
+        idx = bisect.bisect_left(ring.sorted_hashes, key_hash)
 
         # If we're past the end, wrap around to the first hash
-        if idx >= len(self._sorted_hashes):
+        if idx >= len(ring.sorted_hashes):
             idx = 0
 
-        return self._sorted_hashes[idx], idx
+        return ring.sorted_hashes[idx], idx
 
-    def _add_replica_to_ring(self, endpoint_info: EndpointInfo):
+    def _add_replica_to_ring(self, ring: HashRingState, endpoint_info: EndpointInfo):
         """
         Add a replica to the hash ring with virtual nodes.
 
         Args:
+            ring: The hash ring state to update
             endpoint_info: Information about the endpoint to add
         """
         url = endpoint_info.url
 
         # Check if replica is already in the ring (idempotency check)
-        if url in self._available_replicas:
+        if url in ring.available_replicas:
             logger.debug(f"Replica {url} already exists in hash ring, skipping")
             return
 
         # Store the endpoint info
-        self._available_replicas[url] = endpoint_info
+        ring.available_replicas[url] = endpoint_info
 
         # Add virtual nodes to the hash ring
         for i in range(self._virtual_nodes):
@@ -679,42 +723,43 @@ class ConsistentHashRouter(RoutingInterface):
             hash_val = self._hash(virtual_node_key)
 
             # Add to hash ring
-            self._hash_to_endpoint_url[hash_val] = url
-            bisect.insort(self._sorted_hashes, hash_val)
+            ring.hash_to_endpoint_url[hash_val] = url
+            bisect.insort(ring.sorted_hashes, hash_val)
 
         logger.debug(
             f"Added replica {url} to hash ring with {self._virtual_nodes} virtual nodes"
         )
 
-    def _remove_replica_from_ring(self, url: str):
+    def _remove_replica_from_ring(self, ring: HashRingState, url: str):
         """
         Remove a replica from the hash ring.
 
         Args:
+            ring: The hash ring state to update
             url: The endpoint URL to remove
         """
         # Check if replica exists
-        if url not in self._available_replicas:
+        if url not in ring.available_replicas:
             logger.debug(f"Replica {url} not found in hash ring, skipping removal")
             return
 
         # Remove from available replicas
-        del self._available_replicas[url]
+        del ring.available_replicas[url]
 
         # Find all hash points for this replica
         hash_points_to_remove = []
-        for hash_val, endpoint_url in self._hash_to_endpoint_url.items():
+        for hash_val, endpoint_url in ring.hash_to_endpoint_url.items():
             if endpoint_url == url:
                 hash_points_to_remove.append(hash_val)
 
         # Remove from data structures
         for hash_val in hash_points_to_remove:
-            del self._hash_to_endpoint_url[hash_val]
+            del ring.hash_to_endpoint_url[hash_val]
             # Remove ALL occurrences of this hash (in case of duplicates)
-            while hash_val in self._sorted_hashes:
-                idx = bisect.bisect_left(self._sorted_hashes, hash_val)
-                if idx < len(self._sorted_hashes) and self._sorted_hashes[idx] == hash_val:
-                    self._sorted_hashes.pop(idx)
+            while hash_val in ring.sorted_hashes:
+                idx = bisect.bisect_left(ring.sorted_hashes, hash_val)
+                if idx < len(ring.sorted_hashes) and ring.sorted_hashes[idx] == hash_val:
+                    ring.sorted_hashes.pop(idx)
                 else:
                     break
 
@@ -811,20 +856,21 @@ class ConsistentHashRouter(RoutingInterface):
             logger.warning(f"Could not get replica load for {url}: {e}")
             return None
 
-    def _get_total_load(self) -> int:
-        """Get the total load across all replicas."""
+    def _get_total_load(self, ring: HashRingState) -> int:
+        """Get the total load across all replicas in a ring."""
         total = 0
-        for url in self._available_replicas:
+        for url in ring.available_replicas:
             load = self._get_replica_load(url)
             if load is not None:
                 total += load
         return total
 
-    def _check_load(self, url: str) -> bool:
+    def _check_load(self, ring: HashRingState, url: str) -> bool:
         """
         Check if the replica meets the load constraints.
 
         Args:
+            ring: The hash ring state
             url: The endpoint URL to check
 
         Returns:
@@ -836,12 +882,12 @@ class ConsistentHashRouter(RoutingInterface):
             # If we can't determine load, assume it's OK
             return True
 
-        # Calculate average load across all replicas
-        num_replicas = len(self._available_replicas)
+        # Calculate average load across all replicas in this ring
+        num_replicas = len(ring.available_replicas)
         if num_replicas == 0:
             return True
 
-        total_load = self._get_total_load()
+        total_load = self._get_total_load(ring)
         avg_load = (total_load + 1) / num_replicas  # +1 for the current request
 
         # Apply load factor threshold
@@ -850,27 +896,31 @@ class ConsistentHashRouter(RoutingInterface):
         # Check if this replica is under the threshold (including the current request)
         return (load + 1) <= threshold
 
-    def _sync_replicas(self, endpoints: List[EndpointInfo]):
+    def _sync_replicas(self, routing_key: str, ring: HashRingState, endpoints: List[EndpointInfo]):
         """
-        Synchronize the hash ring with the current list of endpoints.
+        Synchronize a specific hash ring with the current list of endpoints.
         This is used as a fallback when service discovery callbacks are not available.
 
         Args:
-            endpoints: Current list of available endpoints
+            routing_key: The routing key for this ring
+            ring: The hash ring state to synchronize
+            endpoints: Current list of available endpoints for this routing key
         """
-        with self._replicas_lock:
-            # Build set of current endpoint URLs
-            current_urls = {e.url for e in endpoints}
-            available_urls = set(self._available_replicas.keys())
+        # Build set of current endpoint URLs
+        current_urls = {e.url for e in endpoints}
+        available_urls = set(ring.available_replicas.keys())
 
-            # Remove endpoints that are no longer available
-            for url in available_urls - current_urls:
-                self._remove_replica_from_ring(url)
+        # Remove endpoints that are no longer available
+        for url in available_urls - current_urls:
+            self._remove_replica_from_ring(ring, url)
 
-            # Add new endpoints
-            for endpoint in endpoints:
-                if endpoint.url not in available_urls:
-                    self._add_replica_to_ring(endpoint)
+        # Add new endpoints
+        for endpoint in endpoints:
+            if endpoint.url not in available_urls:
+                self._add_replica_to_ring(ring, endpoint)
+
+        # Update sync time
+        ring.last_sync_time = time.time()
 
     async def route_request(
         self,
@@ -893,15 +943,24 @@ class ConsistentHashRouter(RoutingInterface):
         Returns:
             The selected endpoint URL
         """
-        # Sync replicas if service discovery callbacks are not working
-        if not self._available_replicas or len(self._available_replicas) != len(endpoints):
-            self._sync_replicas(endpoints)
+        if not endpoints:
+            logger.error("No endpoints available for routing")
+            return None
+
+        # Extract routing key from the first endpoint
+        routing_key = self._get_routing_key(endpoints[0])
 
         with self._replicas_lock:
-            if not self._available_replicas or len(self._sorted_hashes) == 0:
-                logger.warning("No replicas available for consistent hash scheduling")
-                # Fallback to first endpoint if available
-                return endpoints[0].url if endpoints else None
+            # Get or create hash ring for this routing key
+            ring = self._get_or_create_ring(routing_key)
+
+            # Sync replicas if needed
+            if not ring.available_replicas or len(ring.available_replicas) != len(endpoints):
+                self._sync_replicas(routing_key, ring, endpoints)
+
+            if not ring.available_replicas or len(ring.sorted_hashes) == 0:
+                logger.warning(f"No replicas available for routing key {routing_key}")
+                return endpoints[0].url
 
             # Parse request body if not provided
             if request_json is None:
@@ -912,18 +971,19 @@ class ConsistentHashRouter(RoutingInterface):
                     request_json = {}
 
             # Extract cache key
-            request_id = str(uuid.uuid4())  # Generate a request ID as fallback
+            request_id = str(uuid.uuid4())
             cache_key = self._extract_cache_key(request_json, request_id)
 
             # Calculate hash of the cache key
             payload_hash = self._hash(cache_key)
 
             # Find initial replica using consistent hashing
-            replica_hash, replica_idx = self._search(payload_hash)
-            initial_url = self._hash_to_endpoint_url[replica_hash]
+            replica_hash, replica_idx = self._search(ring, payload_hash)
+            initial_url = ring.hash_to_endpoint_url[replica_hash]
 
             logger.debug(
-                f"CHWBL: Initial lookup for payload hash {payload_hash} -> {initial_url}"
+                f"CHWBL: Initial lookup for routing key {routing_key}, "
+                f"payload hash {payload_hash} -> {initial_url}"
             )
 
             # Track replicas we've checked to avoid infinite loops
@@ -932,13 +992,13 @@ class ConsistentHashRouter(RoutingInterface):
 
             # Start from the initial replica and check load constraints
             current_idx = replica_idx
-            while len(checked_urls) < len(self._available_replicas):
-                current_hash = self._sorted_hashes[current_idx]
-                current_url = self._hash_to_endpoint_url[current_hash]
+            while len(checked_urls) < len(ring.available_replicas):
+                current_hash = ring.sorted_hashes[current_idx]
+                current_url = ring.hash_to_endpoint_url[current_hash]
 
                 # Skip if we've already checked this URL
                 if current_url in checked_urls:
-                    current_idx = (current_idx + 1) % len(self._sorted_hashes)
+                    current_idx = (current_idx + 1) % len(ring.sorted_hashes)
                     continue
 
                 checked_urls.add(current_url)
@@ -948,27 +1008,34 @@ class ConsistentHashRouter(RoutingInterface):
                     default_url = current_url
 
                 # Check if this replica meets the load constraints
-                if self._check_load(current_url):
+                if self._check_load(ring, current_url):
                     logger.info(
-                        f"CHWBL: Selected replica {current_url} after checking "
-                        f"{len(checked_urls)} replicas for payload hash {payload_hash}"
+                        f"CHWBL: Selected replica {current_url} for routing key {routing_key} "
+                        f"after checking {len(checked_urls)} replicas (payload hash {payload_hash})"
                     )
                     return current_url
 
                 # Move to next replica
-                current_idx = (current_idx + 1) % len(self._sorted_hashes)
+                current_idx = (current_idx + 1) % len(ring.sorted_hashes)
 
             # If no replica satisfies the load factor, use the default
             if default_url:
                 logger.info(
-                    f"CHWBL: Using default replica {default_url} "
-                    f"as no replica met load factor for payload hash {payload_hash}"
+                    f"CHWBL: Using default replica {default_url} for routing key {routing_key} "
+                    f"as no replica met load factor (payload hash {payload_hash})"
                 )
                 return default_url
 
             # No replicas available at all (shouldn't happen)
-            logger.error("CHWBL: No replicas available after search")
-            return endpoints[0].url if endpoints else None
+            logger.error(f"CHWBL: No replicas available for routing key {routing_key}")
+            return endpoints[0].url
+
+
+@dataclass
+class StaticHashRouterState:
+    """Encapsulates replica list state for a specific workspace+endpoint combination."""
+    replica_list: List[EndpointInfo] = field(default_factory=list)
+    last_sync_time: float = 0.0
 
 
 class StaticHashRouter(RoutingInterface):
@@ -982,6 +1049,7 @@ class StaticHashRouter(RoutingInterface):
     - No virtual nodes (simpler implementation)
     - No load factor checking (purely hash-based)
     - Replicas are stored in a list and selected by hash % replica_count
+    - Multi-tenant support with separate replica lists per workspace+endpoint
 
     Use cases:
     - When you want deterministic routing based on payload
@@ -994,14 +1062,14 @@ class StaticHashRouter(RoutingInterface):
         if hasattr(self, "_initialized"):
             return
 
-        # List of available replicas (maintained via service discovery callbacks)
-        self._replica_list: List[EndpointInfo] = []
+        # Replica lists - separate list per workspace+endpoint
+        self._replica_states: Dict[str, StaticHashRouterState] = {}
         self._replicas_lock = threading.Lock()
 
         # Register callback with service discovery
         self._register_service_discovery_callback()
 
-        logger.info("Initialized StaticHashRouter")
+        logger.info("Initialized StaticHashRouter with multi-tenant support")
         self._initialized = True
 
     def _register_service_discovery_callback(self):
@@ -1048,37 +1116,71 @@ class StaticHashRouter(RoutingInterface):
         with self._replicas_lock:
             if event_type == ServiceDiscoveryEventType.ENGINE_ADDED:
                 if endpoint_info:
+                    routing_key = self._get_routing_key(endpoint_info)
+                    state = self._get_or_create_state(routing_key)
                     # Add replica to list if not already present
-                    if endpoint_info not in self._replica_list:
-                        self._replica_list.append(endpoint_info)
+                    if endpoint_info not in state.replica_list:
+                        state.replica_list.append(endpoint_info)
                         logger.info(
-                            f"StaticHashRouter: Added replica {engine_name} at {endpoint_info.url}. "
-                            f"Total replicas: {len(self._replica_list)}"
+                            f"StaticHashRouter: Added replica {engine_name} at {endpoint_info.url} "
+                            f"to routing key {routing_key}. Total replicas: {len(state.replica_list)}"
                         )
 
             elif event_type == ServiceDiscoveryEventType.ENGINE_DELETED:
                 if endpoint_info:
-                    # Remove replica from list
-                    try:
-                        self._replica_list.remove(endpoint_info)
-                        logger.info(
-                            f"StaticHashRouter: Removed replica {engine_name} at {endpoint_info.url}. "
-                            f"Remaining replicas: {len(self._replica_list)}"
-                        )
-                    except ValueError:
-                        logger.warning(
-                            f"StaticHashRouter: Tried to remove non-existent replica {endpoint_info.url}"
-                        )
+                    routing_key = self._get_routing_key(endpoint_info)
+                    if routing_key in self._replica_states:
+                        state = self._replica_states[routing_key]
+                        # Remove replica from list
+                        try:
+                            state.replica_list.remove(endpoint_info)
+                            logger.info(
+                                f"StaticHashRouter: Removed replica {engine_name} at {endpoint_info.url} "
+                                f"from routing key {routing_key}. Remaining replicas: {len(state.replica_list)}"
+                            )
+                        except ValueError:
+                            logger.warning(
+                                f"StaticHashRouter: Tried to remove non-existent replica {endpoint_info.url}"
+                            )
                 else:
                     # endpoint_info is None, remove by matching engine name from pod_name
-                    self._replica_list = [
-                        ep for ep in self._replica_list
-                        if ep.pod_name != engine_name
-                    ]
+                    for routing_key, state in self._replica_states.items():
+                        state.replica_list = [
+                            ep for ep in state.replica_list
+                            if ep.pod_name != engine_name
+                        ]
                     logger.info(
-                        f"StaticHashRouter: Removed replica by name {engine_name}. "
-                        f"Remaining replicas: {len(self._replica_list)}"
+                        f"StaticHashRouter: Removed replica by name {engine_name} from all routing keys"
                     )
+
+    def _get_routing_key(self, endpoint_info: EndpointInfo) -> str:
+        """
+        Extract routing key from endpoint info.
+
+        Args:
+            endpoint_info: Endpoint information
+
+        Returns:
+            Routing key in format "workspace:endpoint"
+        """
+        workspace = endpoint_info.workspace
+        endpoint = endpoint_info.endpoint
+        return f"{workspace}:{endpoint}"
+
+    def _get_or_create_state(self, routing_key: str) -> StaticHashRouterState:
+        """
+        Get or create a replica state for the given routing key.
+
+        Args:
+            routing_key: The routing key (workspace:endpoint)
+
+        Returns:
+            StaticHashRouterState for this routing key
+        """
+        if routing_key not in self._replica_states:
+            self._replica_states[routing_key] = StaticHashRouterState()
+            logger.debug(f"Created new replica state for routing key: {routing_key}")
+        return self._replica_states[routing_key]
 
     def _hash(self, key: str) -> int:
         """Hash a key to an integer value using MD5."""
@@ -1123,18 +1225,20 @@ class StaticHashRouter(RoutingInterface):
             logger.warning(f"Error extracting payload key: {e}, using request_id")
             return str(request_id)
 
-    def _sync_replicas(self, endpoints: List[EndpointInfo]):
+    def _sync_replicas(self, routing_key: str, state: StaticHashRouterState, endpoints: List[EndpointInfo]):
         """
-        Synchronize the replica list with the current list of endpoints.
+        Synchronize the replica list with the current list of endpoints for a specific routing key.
         This is used as a fallback when service discovery callbacks are not available.
 
         Args:
-            endpoints: Current list of available endpoints
+            routing_key: The routing key for this state
+            state: The replica state to synchronize
+            endpoints: Current list of available endpoints for this routing key
         """
-        with self._replicas_lock:
-            # Simple replacement: update the list
-            self._replica_list = list(endpoints)
-            logger.debug(f"StaticHashRouter: Synced {len(self._replica_list)} replicas")
+        # Simple replacement: update the list
+        state.replica_list = list(endpoints)
+        state.last_sync_time = time.time()
+        logger.debug(f"StaticHashRouter: Synced {len(state.replica_list)} replicas for routing key {routing_key}")
 
     async def route_request(
         self,
@@ -1157,15 +1261,24 @@ class StaticHashRouter(RoutingInterface):
         Returns:
             The selected endpoint URL
         """
-        # Sync replicas if service discovery callbacks are not working
-        if not self._replica_list or len(self._replica_list) != len(endpoints):
-            self._sync_replicas(endpoints)
+        if not endpoints:
+            logger.error("No endpoints available for routing")
+            return None
+
+        # Extract routing key from the first endpoint
+        routing_key = self._get_routing_key(endpoints[0])
 
         with self._replicas_lock:
-            if not self._replica_list:
-                logger.warning("No replicas available for static hash scheduling")
-                # Fallback to first endpoint if available
-                return endpoints[0].url if endpoints else None
+            # Get or create replica state for this routing key
+            state = self._get_or_create_state(routing_key)
+
+            # Sync replicas if needed
+            if not state.replica_list or len(state.replica_list) != len(endpoints):
+                self._sync_replicas(routing_key, state, endpoints)
+
+            if not state.replica_list:
+                logger.warning(f"No replicas available for routing key {routing_key}")
+                return endpoints[0].url
 
             # Parse request body if not provided
             if request_json is None:
@@ -1176,19 +1289,19 @@ class StaticHashRouter(RoutingInterface):
                     request_json = {}
 
             # Extract payload key
-            request_id = str(uuid.uuid4())  # Generate a request ID as fallback
+            request_id = str(uuid.uuid4())
             payload_key = self._extract_payload_key(request_json, request_id)
 
             # Calculate hash of the payload
             payload_hash = self._hash(payload_key)
 
             # Select replica by hash % replica_count
-            replica_idx = payload_hash % len(self._replica_list)
-            selected_replica = self._replica_list[replica_idx]
+            replica_idx = payload_hash % len(state.replica_list)
+            selected_replica = state.replica_list[replica_idx]
 
             logger.debug(
-                f"StaticHashRouter: Payload hash {payload_hash} -> "
-                f"replica {replica_idx}/{len(self._replica_list)} ({selected_replica.url})"
+                f"StaticHashRouter: Payload hash {payload_hash} for routing key {routing_key} -> "
+                f"replica {replica_idx}/{len(state.replica_list)} ({selected_replica.url})"
             )
 
             return selected_replica.url

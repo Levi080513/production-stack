@@ -208,8 +208,29 @@ def initialize_all(app: FastAPI, args):
     if args.callbacks:
         configure_custom_callbacks(args.callbacks, app)
 
-    # support global routing logic initialization
-    # default to initialize required routing logics
+    # Initialize routing logic components
+    # Note: Multiple routing strategies are initialized to support dynamic switching
+    # Each router maintains its own state and can be retrieved via get_routing_logic()
+    #
+    # Routing strategies overview:
+    # - RoundRobinRouter: Simple round-robin distribution across replicas
+    # - SessionRouter: Session-based routing using consistent hashing (requires session_key)
+    # - PrefixAwareRouter: Routes based on longest prefix match for cache efficiency
+    # - DisaggregatedPrefillRouter: Separate prefill and decode endpoints
+    # - ConsistentHashRouter: Payload-based consistent hashing with bounded loads
+    #   * Supports multi-tenant isolation via workspace+endpoint keys
+    #   * Uses virtual nodes (default: 100 per replica) for load distribution
+    #   * Load factor threshold (default: 1.25) prevents overloading
+    #   * Cache key extraction from system prompt + user messages
+    # - StaticHashRouter: Simple deterministic hash-based routing (payload hash % replica_count)
+    #   * Supports multi-tenant isolation via workspace+endpoint keys
+    #   * No virtual nodes or load balancing - purely deterministic
+    #
+    # Multi-tenant isolation: ConsistentHashRouter and StaticHashRouter automatically
+    # maintain separate hash rings/replica lists per (workspace, endpoint) combination,
+    # preventing cross-tenant routing conflicts in multi-model deployments.
+
+    # Default initialization of required routing logics
     for logic in DefaultInitRoutingLogics:
         initialize_routing_logic(
                 logic,
@@ -218,7 +239,12 @@ def initialize_all(app: FastAPI, args):
                 prefill_model_labels=args.prefill_model_labels,
                 decode_model_labels=args.decode_model_labels,
                 kv_aware_threshold=args.kv_aware_threshold,
+                # ConsistentHashRouter parameters (if applicable)
+                # virtual_nodes_per_replica, load_factor, max_user_messages_for_cache
+                # are set to defaults in the router constructor
         )
+
+    # Initialize all routing logics if requested
     if args.routing_logic == "all":
         for logic in AllInitRoutingLogics:
             initialize_routing_logic(
