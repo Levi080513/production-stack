@@ -517,6 +517,7 @@ class HashRingState:
     sorted_hashes: List[int] = field(default_factory=list)
     available_replicas: Dict[str, EndpointInfo] = field(default_factory=dict)
     last_sync_time: float = 0.0
+    lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 class ConsistentHashRouter(RoutingInterface):
@@ -560,7 +561,8 @@ class ConsistentHashRouter(RoutingInterface):
 
         # Hash ring data structures - separate ring per workspace+endpoint
         self._hash_rings: Dict[str, HashRingState] = {}
-        self._replicas_lock = threading.Lock()
+        # Global lock only for creating new routing_key entries
+        self._hash_rings_creation_lock = threading.Lock()
 
         # Register callback with service discovery
         self._register_service_discovery_callback()
@@ -614,12 +616,19 @@ class ConsistentHashRouter(RoutingInterface):
             endpoint_info: Endpoint information (may be None for some events)
         """
         from vllm_router.service_discovery import ServiceDiscoveryEventType
-
-        with self._replicas_lock:
-            if event_type == ServiceDiscoveryEventType.ENGINE_ADDED:
-                if endpoint_info:
-                    routing_key = self._get_routing_key(endpoint_info)
-                    ring = self._get_or_create_ring(routing_key)
+        if endpoint_info:
+            # Filter: only process endpoints matching this router's strategy
+            if endpoint_info.routing_logic and endpoint_info.routing_logic != "consistent_hash":
+                logger.debug(
+                    f"ConsistentHashRouter: Skipping endpoint {endpoint_info.url} "
+                    f"with routing_logic={endpoint_info.routing_logic}"
+                )
+                return
+        if event_type == ServiceDiscoveryEventType.ENGINE_ADDED:
+            if endpoint_info:
+                routing_key = self._get_routing_key(endpoint_info)
+                ring = self._get_or_create_ring(routing_key)
+                with ring.lock:
                     was_added = endpoint_info.url not in ring.available_replicas
                     self._add_replica_to_ring(ring, endpoint_info)
                     if was_added:
@@ -628,11 +637,14 @@ class ConsistentHashRouter(RoutingInterface):
                             f"at {endpoint_info.url} to ring {routing_key}"
                         )
 
-            elif event_type == ServiceDiscoveryEventType.ENGINE_DELETED:
-                if endpoint_info:
-                    routing_key = self._get_routing_key(endpoint_info)
-                    if routing_key in self._hash_rings:
-                        ring = self._hash_rings[routing_key]
+        elif event_type == ServiceDiscoveryEventType.ENGINE_DELETED:
+            if endpoint_info:
+                routing_key = self._get_routing_key(endpoint_info)
+                # Use creation lock to safely check existence
+                with self._hash_rings_creation_lock:
+                    ring = self._hash_rings.get(routing_key)
+                if ring:
+                    with ring.lock:
                         if endpoint_info.url in ring.available_replicas:
                             self._remove_replica_from_ring(ring, endpoint_info.url)
                             logger.info(
@@ -657,6 +669,7 @@ class ConsistentHashRouter(RoutingInterface):
     def _get_or_create_ring(self, routing_key: str) -> HashRingState:
         """
         Get or create a hash ring for the given routing key.
+        Thread-safe with double-checked locking pattern.
 
         Args:
             routing_key: The routing key (workspace:endpoint)
@@ -664,10 +677,20 @@ class ConsistentHashRouter(RoutingInterface):
         Returns:
             HashRingState for this routing key
         """
-        if routing_key not in self._hash_rings:
-            self._hash_rings[routing_key] = HashRingState()
-            logger.debug(f"Created new hash ring for routing key: {routing_key}")
-        return self._hash_rings[routing_key]
+        # Fast path: check without lock
+        ring = self._hash_rings.get(routing_key)
+        if ring is not None:
+            return ring
+
+        # Slow path: create with lock
+        with self._hash_rings_creation_lock:
+            # Double-check after acquiring lock
+            ring = self._hash_rings.get(routing_key)
+            if ring is None:
+                ring = HashRingState()
+                self._hash_rings[routing_key] = ring
+                logger.debug(f"Created new hash ring for routing key: {routing_key}")
+            return ring
 
     def _hash(self, key: str) -> int:
         """Hash a key to an integer value using MD5."""
@@ -950,10 +973,11 @@ class ConsistentHashRouter(RoutingInterface):
         # Extract routing key from the first endpoint
         routing_key = self._get_routing_key(endpoints[0])
 
-        with self._replicas_lock:
-            # Get or create hash ring for this routing key
-            ring = self._get_or_create_ring(routing_key)
+        # Get or create hash ring for this routing key
+        ring = self._get_or_create_ring(routing_key)
 
+        # Use fine-grained lock for this specific routing key
+        with ring.lock:
             # Sync replicas if needed
             if not ring.available_replicas or len(ring.available_replicas) != len(endpoints):
                 self._sync_replicas(routing_key, ring, endpoints)
@@ -1036,6 +1060,7 @@ class StaticHashRouterState:
     """Encapsulates replica list state for a specific workspace+endpoint combination."""
     replica_list: List[EndpointInfo] = field(default_factory=list)
     last_sync_time: float = 0.0
+    lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 class StaticHashRouter(RoutingInterface):
@@ -1064,7 +1089,8 @@ class StaticHashRouter(RoutingInterface):
 
         # Replica lists - separate list per workspace+endpoint
         self._replica_states: Dict[str, StaticHashRouterState] = {}
-        self._replicas_lock = threading.Lock()
+        # Global lock only for creating new routing_key entries
+        self._states_creation_lock = threading.Lock()
 
         # Register callback with service discovery
         self._register_service_discovery_callback()
@@ -1112,12 +1138,19 @@ class StaticHashRouter(RoutingInterface):
             endpoint_info: Endpoint information (may be None for DELETED events)
         """
         from vllm_router.service_discovery import ServiceDiscoveryEventType
-
-        with self._replicas_lock:
-            if event_type == ServiceDiscoveryEventType.ENGINE_ADDED:
-                if endpoint_info:
-                    routing_key = self._get_routing_key(endpoint_info)
-                    state = self._get_or_create_state(routing_key)
+        if endpoint_info:
+            # Filter: only process endpoints matching this router's strategy
+            if endpoint_info.routing_logic and endpoint_info.routing_logic != "static_hash":
+                logger.debug(
+                    f"StaticHashRouter: Skipping endpoint {endpoint_info.url} "
+                    f"with routing_logic={endpoint_info.routing_logic}"
+                )
+                return
+        if event_type == ServiceDiscoveryEventType.ENGINE_ADDED:
+            if endpoint_info:
+                routing_key = self._get_routing_key(endpoint_info)
+                state = self._get_or_create_state(routing_key)
+                with state.lock:
                     # Add replica to list if not already present
                     if endpoint_info not in state.replica_list:
                         state.replica_list.append(endpoint_info)
@@ -1126,11 +1159,14 @@ class StaticHashRouter(RoutingInterface):
                             f"to routing key {routing_key}. Total replicas: {len(state.replica_list)}"
                         )
 
-            elif event_type == ServiceDiscoveryEventType.ENGINE_DELETED:
-                if endpoint_info:
-                    routing_key = self._get_routing_key(endpoint_info)
-                    if routing_key in self._replica_states:
-                        state = self._replica_states[routing_key]
+        elif event_type == ServiceDiscoveryEventType.ENGINE_DELETED:
+            if endpoint_info:
+                routing_key = self._get_routing_key(endpoint_info)
+                # Use creation lock to safely check existence
+                with self._states_creation_lock:
+                    state = self._replica_states.get(routing_key)
+                if state:
+                    with state.lock:
                         # Remove replica from list
                         try:
                             state.replica_list.remove(endpoint_info)
@@ -1142,16 +1178,21 @@ class StaticHashRouter(RoutingInterface):
                             logger.warning(
                                 f"StaticHashRouter: Tried to remove non-existent replica {endpoint_info.url}"
                             )
-                else:
-                    # endpoint_info is None, remove by matching engine name from pod_name
-                    for routing_key, state in self._replica_states.items():
+            else:
+                # endpoint_info is None, remove by matching engine name from pod_name
+                # Need to iterate all states - use creation lock to get snapshot
+                with self._states_creation_lock:
+                    states_snapshot = list(self._replica_states.items())
+
+                for routing_key, state in states_snapshot:
+                    with state.lock:
                         state.replica_list = [
                             ep for ep in state.replica_list
                             if ep.pod_name != engine_name
                         ]
-                    logger.info(
-                        f"StaticHashRouter: Removed replica by name {engine_name} from all routing keys"
-                    )
+                logger.info(
+                    f"StaticHashRouter: Removed replica by name {engine_name} from all routing keys"
+                )
 
     def _get_routing_key(self, endpoint_info: EndpointInfo) -> str:
         """
@@ -1170,6 +1211,7 @@ class StaticHashRouter(RoutingInterface):
     def _get_or_create_state(self, routing_key: str) -> StaticHashRouterState:
         """
         Get or create a replica state for the given routing key.
+        Thread-safe with double-checked locking pattern.
 
         Args:
             routing_key: The routing key (workspace:endpoint)
@@ -1177,10 +1219,20 @@ class StaticHashRouter(RoutingInterface):
         Returns:
             StaticHashRouterState for this routing key
         """
-        if routing_key not in self._replica_states:
-            self._replica_states[routing_key] = StaticHashRouterState()
-            logger.debug(f"Created new replica state for routing key: {routing_key}")
-        return self._replica_states[routing_key]
+        # Fast path: check without lock
+        state = self._replica_states.get(routing_key)
+        if state is not None:
+            return state
+
+        # Slow path: create with lock
+        with self._states_creation_lock:
+            # Double-check after acquiring lock
+            state = self._replica_states.get(routing_key)
+            if state is None:
+                state = StaticHashRouterState()
+                self._replica_states[routing_key] = state
+                logger.debug(f"Created new replica state for routing key: {routing_key}")
+            return state
 
     def _hash(self, key: str) -> int:
         """Hash a key to an integer value using MD5."""
@@ -1268,10 +1320,11 @@ class StaticHashRouter(RoutingInterface):
         # Extract routing key from the first endpoint
         routing_key = self._get_routing_key(endpoints[0])
 
-        with self._replicas_lock:
-            # Get or create replica state for this routing key
-            state = self._get_or_create_state(routing_key)
+        # Get or create replica state for this routing key
+        state = self._get_or_create_state(routing_key)
 
+        # Use fine-grained lock for this specific routing key
+        with state.lock:
             # Sync replicas if needed
             if not state.replica_list or len(state.replica_list) != len(endpoints):
                 self._sync_replicas(routing_key, state, endpoints)
